@@ -1,131 +1,131 @@
-# FTS uid experiment - замена строковых лексем на целочисленные идентификаторы
+# FTS uid experiment - replacing string tokens with integer identifiers
 
-## Мотивация
+## Motivation
 
-PostgreSQL FTS хранит лексемы в `tsvector` как переменные строки. При поиске и ранжировании
-документов ядро делает бинарный поиск по лексемам с побайтовым сравнением строк. Гипотеза:
+PostgreSQL FTS stores tokens in the 'tsvector` as string variables. When searching and ranking
+documents, the kernel performs a binary search for tokens with byte-by-byte string comparison. Hypothesis:
 
-> Если заменить строковые лексемы на фиксированные 4-байтные целочисленные идентификаторы,
-> то уменьшится размер `tsvector`, ускорится проход по GIN/GIST, и - главное - ускорятся
-> функции `ts_rank` / `ts_rank_cd`, которые индекс не используют и работают целиком на CPU.
+> If you replace string tokens with fixed 4-byte integer identifiers,
+> then the size of the `tsvector` will decrease, the passage through GIN/GIST will accelerate, and - most importantly - they will accelerate
+> the `ts_rank` / `ts_rank_cd` functions that do not use the index and run entirely on the CPU.
 
-Настоящий C-extension пока не пишется. Вместо этого делается прокси: лексемы
-заменяются 4-символьными строками из алфавита `0-9a-z` (base36). Ширина ключа та же -
-4 байта, - поэтому прокси является честным нижним порогом для реального int4-extension.
+The real C-extension is not being written yet. Instead, a proxy is made: tokens
+are replaced with 4-character strings from the alphabet `0-9a-z` (base36). The key width is the same -
+4 bytes - so the proxy is an honest lower threshold for a real int4 extension.
 
 ---
 
-## Методология
+## Methodology
 
-### Прокси-кодирование
+### Proxy encoding
 
-Вместо настоящего `int4` используется строка из 4 символов алфавита `0-9a-z` (36 символов,
-36^4 = 1 679 616 уникальных значений). Алфавит выбран строчным потому, что `to_tsquery('simple', ...)`
-приводит токены к нижнему регистру - заглавные символы вызывали бы коллизии.
+Instead of the real `int4`, a string of 4 characters of the alphabet `0-9a-z` is used (36 characters,
+36^4 = 1,679,616 unique values). The alphabet is chosen in lowercase because `to_tsquery('simple', ...)`
+lowercases tokens - uppercase characters would cause collisions.
 
-Пример: лексема `"initi"` (самая частая в корпусе) получает id 1 -> encoded = `"0001"`.
+Example: the token `"initi"` (the most frequent in the corpus) gets id 1 -> encoded = `"0001"`.
 
-Позиции и веса слов в `tsvector` сохраняются полностью, поэтому прокси-вектор
-семантически эквивалентен исходному: проверяется верификационным шагом.
+The positions and weights of words in the tsvector are fully preserved, so the proxy vector
+is semantically equivalent to the original one: it is checked by a verification step.
 
-### Параметры бенчмарка
+### Benchmark parameters
 
-| Параметр | Значение |
+| Parameter | Value |
 |---|---|
 | PostgreSQL | 14.23 |
-| Корпус | 10 000 документов, 50-200 слов, синтетика из `/usr/share/dict/words` |
-| Конфигурация FTS | `english` (для baseline), `simple` (для прокси-запросов) |
-| JIT | выключен (`SET jit = off`) |
-| Параллелизм | выключен (`max_parallel_workers_per_gather = 0`) |
-| Кэш | тёплый (всё в `shared_buffers`) |
-| Повторений | 10 прогонов на каждую точку, медиана |
-| GIN vs GIST | замеряются раздельно: перед GIN-замером дропается GIST, и наоборот |
+| Corpus | 10,000 documents, 50-200 words, synthetic from `/usr/share/dict/words` |
+| FTS configuration | `english` (for baseline), `simple` (for proxy requests) |
+| JIT | disabled (`SET jit = off`) |
+| Concurrency | disabled (`max_parallel_workers_per_gather = 0`) |
+| Cache | warm (all in `shared_buffers`) |
+| Repetitions | 10 runs per point, median |
+| GIN vs GIST | are measured separately: GIST is dropped before GIN measurement, and vice versa |
 
-### Запросная нагрузка
+### Request load
 
-- **single** - 500 запросов по одному термину (топ-500 по частоте в корпусе)
-- **and2** - 200 AND-запросов из двух термин
-- **phrase** - 200 фразовых запросов (`<->`)
+- **single** - 500 queries per term (top 500 in terms of frequency in the corpus)
+- **and2** - 200 AND-requests from two terms
+- **phrase** - 200 phrase queries (`<->`)
 
-Для каждого текстового запроса строится его прокси-двойник: лексемы заменяются
-закодированными id, конфигурация меняется с `english` на `simple`.
+For each text query, its proxy twin is built: tokens are replaced
+with encoded IDs, the configuration is changed from `english` to `simple`.
 
 ---
 
-## Структура репозитория
+## Repository structure
 
 ```
 FTS_uid_research/
-├── gen_corpus.py           # генератор корпуса (seed=42, воспроизводимо)
-├── run_experiment.sh       # скрипт запуска
+├── gen_corpus.py # case generator (seed=42, reproducible)
+├── run_experiment.sh # startup script
 └── sql/
-    ├── 00_setup.sql        # таблицы docs + bench_results, GUC-фиксация
-    ├── 02_baseline.sql     # STORED tsvector-колонка + GIN + GIST
-    ├── 03_dict.sql         # encode_id(), decode_id(), таблица lex_dict
-    ├── 04_encode.sql       # tsv_to_int(), батчевый UPDATE + индексы
-    ├── 05_verify.sql       # проверка эквивалентности результатов поиска
-    ├── 06_bench_search.sql # таблица bench_queries + EXPLAIN ANALYZE BUFFERS
-    ├── 07_bench_rank.sql   # TABLESAMPLE throughput + top-20 сценарий
-    └── 08_results.sql      # размеры + медианы
+├── 00_setup.sql # docs tables + bench_results, GUC commit
+    ├── 02_baseline.sql # STORED tsvector-column + GIN + GIST
+    ├── 03_dict.sql # encode_id(), decode_id(), lex_dict table
+    ├── 04_encode.sql # tsv_to_int(), batch UPDATE + indexes
+├── 05_verify.sql # checking the equivalence of search results
+    ├── 06_bench_search.sql # bench_queries table + EXPLAIN ANALYZE BUFFERS
+    ,── 07_bench_rank.sql # TABLESAMPLE throughput + top-20 scenario
+    └── 08_results.sql # sizes + medians
 ```
 
 ---
 
-## Запуск
+## Launch
 
 ```bash
-# Полный прогон (создаёт БД fts_bench, генерирует 500K документов)
+# Full run (creates fts_bench database, generates 500K documents)
 ./run_experiment.sh --clean --docs 500000
 
-# Быстрый тест на маленьком корпусе
-./run_experiment.sh --clean --docs 10000
+# Quick test on a small
+case./run_experiment.sh --clean --docs 10000
 
-# Только замеры (данные уже загружены)
+# Measurements only (data has already been uploaded)
 ./run_experiment.sh --only-bench --bench-runs 10
 ```
 
-Результаты сохраняются в `results/`:
-- `timings_YYYYMMDD_HHMMSS.csv` - сырые замеры
-- `report_YYYYMMDD_HHMMSS.txt` - текстовый отчёт из `08_results.sql`
-- `experiment_YYYYMMDD_HHMMSS.log` - полный лог
+The results are saved in `results/`:
+- `timings_YYYYMMDD_HHMMSS.csv` - raw measurements
+- `report_YYYYMMDD_HHMMSS.txt ` - text report from `08_results.sql`
+- `experiment_YYYYMMDD_HHMMSS.log` - full log
 
 ---
 
-## Результаты (10 000 документов, тёплый кэш)
+## Results (10,000 documents, warm cache)
 
-### Размеры
+### Dimensions
 
-| Объект | Baseline (строки) | Int-прокси (base36) | Изменение |
+| Object | Baseline (lines) | Int Proxy (base36) | Change |
 |---|---|---|---|
-| Heap-колонка tsvector | 18 MB | 14 MB | **−19%** |
-| Средний tsvector на строку | 1 859 байт | 1 503 байт | **−19%** |
-| GIN-индекс | 7 968 kB | 7 856 kB | −1.4% |
-| GIST-индекс | 3 336 kB | 3 360 kB | +0.7% (в пределах шума) |
+| tsvector heap column | 18 MB | 14 MB | **-19%** |
+| Average tsvector per line | 1,859 bytes | 1,503 bytes | **-19%** |
+| GIN index | 7,968 kB | 7,856 kB | -1.4% |
+| GIST index | 3,336 kB | 3,360 kB | +0.7% (within noise limits) |
 
-Размер лексикона: 25 294 уникальных лексемы (10K документов, конфигурация `english`).
-Максимальный закодированный id: `0jim` (база 36, 4 символа, диапазон покрывает 1.67M лексем).
+Lexicon size: 25,294 unique tokens (10K documents, `english` configuration).
+Maximum encoded id: `0jim` (base 36, 4 characters, range covers 1.67M tokens).
 
-### Производительность поиска (GIN)
+### Search Performance (GIN)
 
-Перед GIN-замером GIST-индексы дропались, чтобы планировщик гарантированно использовал GIN.
+Before the GIN measurement, the GIST indexes were dropped so that the scheduler was guaranteed to use GIN.
 
-| Тип запроса | Baseline, мс | Int-прокси, мс | Speedup |
+| Request type | Baseline, ms | Int proxy, ms | Speedup |
 |---|---|---|---|
-| single (один термин) | 2.59 | 1.93 | **x1.34** |
-| and2 (два термина AND) | 0.25 | 0.24 | x1.03 |
-| phrase (фраза `<->`) | 0.37 | 0.37 | x1.02 |
+| single (one term) | 2.59 | 1.93 | **x1.34** |
+| and2 (two terms AND) | 0.25 | 0.24 | x1.03 |
+| phrase (phrase `<->`) | 0.37 | 0.37 | x1.02 |
 
-### Производительность поиска (GIST)
+### Search Performance (GIST)
 
-| Тип запроса | Baseline, мс | Int-прокси, мс | Speedup |
+| Request type | Baseline, ms | Int proxy, ms | Speedup |
 |---|---|---|---|
 | single | 9.20 | 9.26 | x0.99 |
 | and2 | 2.93 | 3.84 | x0.76 |
 | phrase | 2.99 | 3.91 | x0.77 |
 
-### Производительность ранжирования - тёплый кэш (TABLESAMPLE 2% ~ 200 строк)
+### Ranking performance - warm cache (TABLESAMPLE 2%~200 rows)
 
-| Функция | Тип запроса | Baseline, мс | Int-прокси, мс | Speedup |
+| Function | Request type | Baseline, ms | Int Proxy, ms | Speedup |
 |---|---|---|---|---|
 | `ts_rank` | single | 1.44 | 1.19 | **x1.21** |
 | `ts_rank` | and2 | 1.53 | 1.22 | **x1.25** |
@@ -134,38 +134,38 @@ FTS_uid_research/
 
 ---
 
-## Результаты - холодный кэш
+## Results - cold cache
 
-Перед каждым замером: `CHECKPOINT` + `sync` + `echo 3 > /proc/sys/vm/drop_caches`.
-Это сбрасывает как page cache ОС, так и PostgreSQL shared_buffers (после CHECKPOINT грязные
-страницы записаны на диск и могут быть вытеснены ОС).
+Before each measurement: `CHECKPOINT` + `sync' + `echo 3 > /proc/sys/vm/drop_caches`.
+This resets both the OS page cache and PostgreSQL shared_buffers (after CHECKPOINT, dirty
+pages are written to disk and can be evicted by the OS).
 
-### Производительность поиска (GIN, холодный кэш)
+### Search performance (GIN, cold cache)
 
-| Тип запроса | Baseline, мс | Int-прокси, мс | Speedup |
+| Request type | Baseline, ms | Int proxy, ms | Speedup |
 |---|---|---|---|
 | single | 1.95 | 1.96 | x1.00 |
 | and2 | 0.23 | 0.30 | x0.75 |
 
-### Производительность поиска (GIST, холодный кэш)
+### Search performance (GIST, cold cache)
 
-| Тип запроса | Baseline, мс | Int-прокси, мс | Speedup |
+| Request type | Baseline, ms | Int proxy, ms | Speedup |
 |---|---|---|---|
 | single | 9.32 | 8.75 | **x1.07** |
 | and2 | 3.04 | 3.79 | x0.80 |
 
-### Производительность ранжирования - холодный кэш
+### Ranking performance - Cold cache
 
-| Функция | Тип запроса | Baseline, мс | Int-прокси, мс | Speedup |
+| Function | Request type | Baseline, ms | Int Proxy, ms | Speedup |
 |---|---|---|---|---|
 | `ts_rank` | single | 1.60 | 1.22 | **x1.31** |
 | `ts_rank` | and2 | 1.63 | 1.36 | **x1.20** |
 | `ts_rank_cd` | single | 1.71 | 1.38 | **x1.24** |
 | `ts_rank_cd` | and2 | 1.90 | 1.57 | **x1.21** |
 
-### Сводная таблица: warm vs cold
+### Summary table: warm vs cold
 
-| Метрика | Warm | Cold |
+| Metric | Warm | Cold |
 |---|---|---|
 | GIN single | x0.99 | x1.00 |
 | GIST single | x1.00 | **x1.07** |
@@ -174,7 +174,7 @@ FTS_uid_research/
 
 ---
 
-## Краткие результаты для 500 000 документов (теплый + холодный кэш)
+## Summary results for 500,000 documents (warm + cold cache)
 ```
 === Speedup ratios (baseline_ms / int_ms) ===
   GIN search (warm)      single    x1.04  (int-proxy faster)
@@ -197,34 +197,33 @@ FTS_uid_research/
   ts_rank_cd (cold)      and2      x1.08  (int-proxy faster)
 ```
 
-## Интерпретация результатов
+## Interpretation of results
 
-### Ранжирование: гипотеза подтверждается, эффект устойчив
+### Ranking: the hypothesis is confirmed, the effect is stable
 
-`ts_rank` и `ts_rank_cd` ускоряются на **8-44%** как при тёплом, так и при холодном кэше.
-Ускорение при холодном кэше даже чуть выше: меньший `tsvector` -> меньше страниц читается
-с диска при TABLESAMPLE-сканировании + быстрее CPU-сравнения. Это сугубо CPU-эффект,
-не зависящий от I/O - функции ранжирования индекс не используют.
+`ts_rank` and `ts_rank_cd` are accelerated by **8-44%** with both warm and cold cache.
+Acceleration with a cold cache is even slightly higher: a smaller `tsvector` -> fewer pages are read
+from disk with TABLESAMPLE scanning + faster CPU comparisons. This is purely a CPU effect,
+independent of the I/O - the index ranking function is not used.
 
-### GIN: разница в пределах шума на 10K корпусе
+### GIN: The difference in noise limits on a 10K enclosure
 
-Однотерминный GIN-поиск показывает x0.99-1.00 - практически без разницы. Причина: GIN
-posting-листы по размеру примерно одинаковы (7968 vs 7856 kB, разница 1.4%), а 10K документов
-полностью помещаются в кэш. Значимая разница ожидалась на 500K+ документов, предполагалось что индекс не
-помещается в память и I/O-чтения более коротких posting-листов дадут измеримый выигрыш, но по результату выигрыш получился небольшой: x1.00-1.04 
+A one-minute GIN search shows x0.99-1.00 - almost no difference. Reason: GIN
+The posting sheets are about the same size (7968 vs 7856 kB, 1.4% difference), and 10K documents
+are fully cached. A significant difference was expected for 500K+ documents, it was assumed that the index would not
+fit into memory and I/O readings of shorter posting sheets would give a measurable gain, but the result was a small gain: x1.00-1.04 
 
-### GIST: структурное замедление для AND-запросов
+### GIST: structural slowdown for AND queries
 
-GIST замедляется для AND/phrase как в тёплом (x0.78), так и в холодном (x0.80) режиме.
-Это не I/O-артефакт - разрыв одинаков при любом состоянии кэша. Скорее всего здесь структурная причина:
-GIST использует сигнатурное хэширование лексем для построения bitmap. Base36-идентификаторы
-вида `0001`, `0002`, … сконцентрированы в начале алфавита и хуже распределяются по
-хэш-пространству, чем естественные английские слова. Это приводит к большему числу
-false-positive при проверке AND-условия и дополнительным heap-fetches для recheck.
+GIST slows down for AND/phrase in both warm (x0.78) and cold (x0.80) mode.
+This is not an I/O artifact - the gap is the same for any cache state. Most likely there is a structural reason here:
+GIST uses signature hashing of tokens to build a bitmap. Base36 identifiers
+like `0001`, `0002`, ... are concentrated at the beginning of the alphabet and are worse distributed in the
+hash space than natural English words. This results in a higher number
+false-positive when checking the AND-condition and additional heap-fetches for recheck.
 
-### Ограничение прокси
+### Proxy restriction
 
-Прокси использует строки base36 (4 байта содержимого + 1 байт varlena-заголовок = 5 байт)
-вместо настоящего `int4` (4 байта без заголовка). Кроме того, сравнение строк - это `memcmp`,
-тогда как int4 сравнивается одной машинной инструкцией. Поэтому если прокси даёт X% ускорения - реальный int4-extension даст не меньше X%.
-
+The proxy uses base36 strings (4 bytes of content + 1 byte varlena header = 5 bytes)
+instead of the real `int4` (4 bytes without header). Also, string comparison is a `memcmp`,
+whereas int4 is compared by a single machine instruction. Therefore, if the proxy gives X% acceleration, the real int4-extension will give at least X%.
